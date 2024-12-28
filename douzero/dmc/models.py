@@ -157,7 +157,7 @@ class GeneralModelBid(nn.Module):
         out = self.linear4(out)
         win_rate, win, lose = torch.split(out, (3, 1, 1), dim=-1)
         win_rate = torch.softmax(win_rate, dim=-1)
-        out = win_rate[:, 0] * win + win_rate[:, 1] * lose
+        out = win_rate[:, :1] * win + win_rate[:, 1:2] * lose
 
         if return_value:
             return dict(values=(win_rate, win, lose))

@@ -94,7 +94,7 @@ class DeepAgent:
                     best_action = infoset.legal_actions[best_action_index]
                 return best_action
             else:
-                y_pred = win_rate[:, 0] * win + win_rate[:, 1] * lose
+                y_pred = win_rate[:, :1] * win + win_rate[:, 1:2] * lose
         y_pred = y_pred.detach().cpu().numpy()
 
         best_action_index = np.argmax(y_pred, axis=0)[0]

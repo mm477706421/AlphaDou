@@ -18,6 +18,8 @@ from .utils import get_batch, log, create_env, create_optimizers, act
 mean_episode_return_buf = {p: deque(maxlen=50) for p in
                            ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']}
 
+save_mark = 0
+
 
 def compute_loss(logits, targets):
     loss = ((logits.squeeze(-1) - targets) ** 2).mean()
@@ -128,12 +130,6 @@ def train(flags):
                        "landlord_down": ctx.SimpleQueue()}
         batch_queues[device] = batch_queue
 
-    # Learner model for training
-    learner_model = Model(device=flags.training_device)
-
-    # Create optimizers
-    optimizers = create_optimizers(flags, learner_model)
-
     # Stat Keys
     stat_keys = [
         'mean_episode_return_first',
@@ -152,26 +148,55 @@ def train(flags):
     frames, stats = 0, {k: 0 for k in stat_keys}
     position_frames = {'first': 0, 'second': 0, 'third': 0, 'landlord': 0, 'landlord_up': 0, 'landlord_down': 0}
 
-    # Load models if any
-    if flags.load_model and os.path.exists(checkpointpath):
-        checkpoint_states = torch.load(
-            checkpointpath,
-            map_location=("cuda:" + str(flags.training_device) if flags.training_device != "cpu" else "cpu")
-        )
-
-        for k in ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']:
-            learner_model.get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
-            optimizers[k].load_state_dict(checkpoint_states["optimizer_state_dict"][k])
-            for device in device_iterator:
-                models[device].get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
-        stats = checkpoint_states["stats"]
-        frames = checkpoint_states["frames"]
-        position_frames = checkpoint_states["position_frames"]
-        log.info(f"Resuming preempted job, current stats:\n{stats}")
-
     def batch_and_learn(i, device, position, local_lock, position_lock, lock=threading.Lock()):
         """Thread target for the learning process."""
         nonlocal frames, position_frames, stats
+        global save_mark
+
+        # Learner model for training
+        learner_model = Model(device=flags.training_device)
+
+        # Create optimizers
+        optimizers = create_optimizers(flags, learner_model)
+
+        # Load models if any
+        if flags.load_model and os.path.exists(checkpointpath):
+            checkpoint_states = torch.load(
+                checkpointpath,
+                map_location=("cuda:" + str(flags.training_device) if flags.training_device != "cpu" else "cpu")
+            )
+
+            for k in ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']:
+                learner_model.get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
+                optimizers[k].load_state_dict(checkpoint_states["optimizer_state_dict"][k])
+                for de in device_iterator:
+                    models[de].get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
+            stats = checkpoint_states["stats"]
+            frames = checkpoint_states["frames"]
+            position_frames = checkpoint_states["position_frames"]
+            log.info(f"Resuming preempted job, current stats:\n{stats}")
+
+        def checkpoint(frames):
+            global save_mark
+            if flags.disable_checkpoint:
+                return
+            log.info('Saving checkpoint to %s', checkpointpath)
+            _models = learner_model.get_models()
+            torch.save({
+                'model_state_dict': {k: _models[k].state_dict() for k in _models},
+                'optimizer_state_dict': {k: optimizers[k].state_dict() for k in optimizers},
+                "stats": stats,
+                'flags': vars(flags),
+                'frames': frames,
+                'position_frames': position_frames
+            }, checkpointpath)
+            save_mark = frames
+            # Save the weights for evaluation purpose
+            for position in ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']:
+                model_weights_dir = os.path.expandvars(os.path.expanduser(
+                    '%s/%s/%s' % (flags.savedir, flags.xpid, position + '_' + str(frames) + '.ckpt')))
+                torch.save(learner_model.get_model(position).state_dict(), model_weights_dir)
+
         while frames < flags.total_frames:
             batch = get_batch(batch_queues[device][position], position, flags, local_lock)
             _stats = learn(position, models, learner_model.get_model(position), batch,
@@ -184,6 +209,8 @@ def train(flags):
                 plogger.log(to_log)
                 frames += T * B
                 position_frames[position] += T * B
+                if frames - save_mark > flags.save_interval_frames:
+                    checkpoint(frames)
 
     threads = []
     locks = {}
@@ -213,26 +240,6 @@ def train(flags):
             actor.start()
             actor_processes.append(actor)
 
-    def checkpoint(frames):
-        if flags.disable_checkpoint:
-            return
-        log.info('Saving checkpoint to %s', checkpointpath)
-        _models = learner_model.get_models()
-        torch.save({
-            'model_state_dict': {k: _models[k].state_dict() for k in _models},
-            'optimizer_state_dict': {k: optimizers[k].state_dict() for k in optimizers},
-            "stats": stats,
-            'flags': vars(flags),
-            'frames': frames,
-            'position_frames': position_frames
-        }, checkpointpath)
-
-        # Save the weights for evaluation purpose
-        for position in ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']:
-            model_weights_dir = os.path.expandvars(os.path.expanduser(
-                '%s/%s/%s' % (flags.savedir, flags.xpid, position + '_' + str(frames) + '.ckpt')))
-            torch.save(learner_model.get_model(position).state_dict(), model_weights_dir)
-
     fps_log = []
     timer = timeit.default_timer
     try:
@@ -243,9 +250,6 @@ def train(flags):
             start_time = timer()
             time.sleep(5)
 
-            if timer() - last_checkpoint_time > flags.save_interval * 60:
-                checkpoint(frames)
-                last_checkpoint_time = timer()
             end_time = timer()
 
             fps = (frames - start_frames) / (end_time - start_time)
@@ -275,5 +279,4 @@ def train(flags):
             thread.join()
         log.info('Learning finished after %d frames.', frames)
 
-    checkpoint(frames)
     plogger.close()
