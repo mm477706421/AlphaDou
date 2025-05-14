@@ -148,33 +148,36 @@ def train(flags):
     frames, stats = 0, {k: 0 for k in stat_keys}
     position_frames = {'first': 0, 'second': 0, 'third': 0, 'landlord': 0, 'landlord_up': 0, 'landlord_down': 0}
 
+    # Learner model for training
+    learner_model = Model(device=flags.training_device)
+
+    # Create optimizers
+    optimizers = create_optimizers(flags, learner_model)
+
+    # Load models if any
+    if flags.load_model and os.path.exists(checkpointpath):
+        checkpoint_states = torch.load(
+            checkpointpath,
+            map_location=("cuda:" + str(flags.training_device) if flags.training_device != "cpu" else "cpu")
+        )
+
+        for k in ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']:
+            learner_model.get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
+            for de in device_iterator:
+                models[de].get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
+        stats = checkpoint_states["stats"]
+        frames = checkpoint_states["frames"]
+        position_frames = checkpoint_states["position_frames"]
+        log.info(f"Resuming preempted job, current stats:\n{stats}")
+
     def batch_and_learn(i, device, position, local_lock, position_lock, lock=threading.Lock()):
         """Thread target for the learning process."""
-        nonlocal frames, position_frames, stats
+        nonlocal frames, position_frames, stats, models, learner_model
         global save_mark
 
-        # Learner model for training
-        learner_model = Model(device=flags.training_device)
-
-        # Create optimizers
-        optimizers = create_optimizers(flags, learner_model)
-
-        # Load models if any
-        if flags.load_model and os.path.exists(checkpointpath):
-            checkpoint_states = torch.load(
-                checkpointpath,
-                map_location=("cuda:" + str(flags.training_device) if flags.training_device != "cpu" else "cpu")
-            )
-
-            for k in ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']:
-                learner_model.get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
-                optimizers[k].load_state_dict(checkpoint_states["optimizer_state_dict"][k])
-                for de in device_iterator:
-                    models[de].get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
-            stats = checkpoint_states["stats"]
-            frames = checkpoint_states["frames"]
-            position_frames = checkpoint_states["position_frames"]
-            log.info(f"Resuming preempted job, current stats:\n{stats}")
+        for pos in ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']:
+            for actor_model in models.values():
+                actor_model.get_model(pos).load_state_dict(learner_model.get_model(pos).state_dict())
 
         def checkpoint(frames):
             global save_mark
@@ -243,7 +246,6 @@ def train(flags):
     fps_log = []
     timer = timeit.default_timer
     try:
-        last_checkpoint_time = timer() - flags.save_interval * 60
         while frames < flags.total_frames:
             start_frames = frames
             position_start_frames = {k: position_frames[k] for k in position_frames}
