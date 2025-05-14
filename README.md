@@ -21,6 +21,9 @@ python version 3.9.12
 
 pytorch version 2.0.0
 
+Ubuntu20.04
+
+Try to use linux for training, windows may have unknown bugs!
 
 To use GPU for training, run
 ```
