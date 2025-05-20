@@ -163,6 +163,8 @@ def train(flags):
 
         for k in ['first', 'second', 'third', 'landlord', 'landlord_up', 'landlord_down']:
             learner_model.get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
+            optimizers[k].load_state_dict(checkpoint_states["optimizer_state_dict"][k])
+            optimizers[k].param_groups[0]['lr'] = flags.learning_rate
             for de in device_iterator:
                 models[de].get_model(k).load_state_dict(checkpoint_states["model_state_dict"][k])
         stats = checkpoint_states["stats"]
