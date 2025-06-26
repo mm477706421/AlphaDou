@@ -747,9 +747,12 @@ def _get_default_obs(infoset, position=None):
     return obs
 
 def _get_obs_general(infoset, position):
+    """
+    获取通用观察空间,与InfoSet格式保持一致
+    """
     num_legal_actions = len(infoset.legal_actions)
     
-    # 基础特征
+    # 基础特征 (手牌信息)
     my_handcards = _cards2array(infoset.player_hand_cards)
     my_handcards_batch = np.repeat(my_handcards[np.newaxis, :],
                                    num_legal_actions, axis=0)
@@ -768,15 +771,10 @@ def _get_obs_general(infoset, position):
     position_info_batch = np.repeat(position_info[np.newaxis, :],
                                     num_legal_actions, axis=0)
 
-    # 叫分信息 (12维)
+    # 叫分和倍数信息
     bid_info = np.array(infoset.bid_info).flatten()
     bid_info_batch = np.repeat(bid_info[np.newaxis, :],
                                num_legal_actions, axis=0)
-
-    # 倍数信息 (3维)
-    multiply_info = np.array(infoset.multiply_info)
-    multiply_info_batch = np.repeat(multiply_info[np.newaxis, :],
-                                    num_legal_actions, axis=0)
 
     # 地主牌信息
     three_landlord_cards = _cards2array(infoset.three_landlord_cards)
@@ -789,72 +787,42 @@ def _get_obs_general(infoset, position):
                                   num_legal_actions, axis=0)
 
     # 当前动作
-    my_action_batch = np.zeros(my_handcards_batch.shape)
+    my_action_batch = np.zeros((num_legal_actions, 54))
     for j, action in enumerate(infoset.legal_actions):
         my_action_batch[j, :] = _cards2array(action)
 
     # 剩余牌数信息
-    landlord_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord'], 20)
-    landlord_num_cards_left_batch = np.repeat(
-        landlord_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_up_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord_up'], 17)
-    landlord_up_num_cards_left_batch = np.repeat(
-        landlord_up_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_down_num_cards_left = _get_one_hot_array(
-        infoset.num_cards_left_dict['landlord_down'], 17)
-    landlord_down_num_cards_left_batch = np.repeat(
-        landlord_down_num_cards_left[np.newaxis, :],
-        num_legal_actions, axis=0)
+    num_cards_left = np.zeros((num_legal_actions, 54))  # 使用54维向量表示剩余牌数
+    for pos, num in infoset.num_cards_left_dict.items():
+        if num > 0:
+            num_cards_left[:, :] += (num / 20.0)  # 归一化
 
     # 已出牌信息
-    landlord_played_cards = _cards2array(
-        infoset.played_cards['landlord'])
-    landlord_played_cards_batch = np.repeat(
-        landlord_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_up_played_cards = _cards2array(
-        infoset.played_cards['landlord_up'])
-    landlord_up_played_cards_batch = np.repeat(
-        landlord_up_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
-
-    landlord_down_played_cards = _cards2array(
-        infoset.played_cards['landlord_down'])
-    landlord_down_played_cards_batch = np.repeat(
-        landlord_down_played_cards[np.newaxis, :],
-        num_legal_actions, axis=0)
+    played_cards = {pos: _cards2array(cards) for pos, cards in infoset.played_cards.items()}
+    played_cards_batch = np.zeros((num_legal_actions, 162))  # 3个位置的出牌信息拼接
+    for i, pos in enumerate(['landlord', 'landlord_up', 'landlord_down']):
+        played_cards_batch[:, i*54:(i+1)*54] = np.repeat(played_cards[pos][np.newaxis, :],
+                                                        num_legal_actions, axis=0)
 
     # 炸弹数
-    bomb_num = _get_one_hot_bomb(infoset.bomb_num)
-    bomb_num_batch = np.repeat(
-        bomb_num[np.newaxis, :],
-        num_legal_actions, axis=0)
+    bomb_num = np.zeros(15)  # 15维向量表示炸弹数
+    bomb_num[infoset.bomb_num] = 1
+    bomb_num_batch = np.repeat(bomb_num[np.newaxis, :],
+                              num_legal_actions, axis=0)
 
     # 组合所有特征
     x_batch = np.hstack((
-        position_info_batch,      # 3
-        my_handcards_batch,      # 54
-        other_handcards_batch,   # 54
+        position_info_batch,          # 3
+        my_handcards_batch,          # 54
+        other_handcards_batch,       # 54
         three_landlord_cards_batch,  # 54
-        last_action_batch,       # 54
-        landlord_played_cards_batch,  # 54
-        landlord_up_played_cards_batch,  # 54
-        landlord_down_played_cards_batch,  # 54
-        landlord_num_cards_left_batch,  # 20
-        landlord_up_num_cards_left_batch,  # 17
-        landlord_down_num_cards_left_batch,  # 17
-        bomb_num_batch,          # 15
-        bid_info_batch,          # 12
-        multiply_info_batch,     # 3
-        my_action_batch         # 54
-    ))
+        last_action_batch,           # 54
+        played_cards_batch,          # 162
+        num_cards_left,              # 54
+        bomb_num_batch,              # 15
+        bid_info_batch,              # 12
+        my_action_batch              # 54
+    ))                               # 总计: 516维
 
     # 无动作特征
     x_no_action = np.hstack((
@@ -863,15 +831,12 @@ def _get_obs_general(infoset, position):
         other_handcards,
         three_landlord_cards,
         last_action,
-        landlord_played_cards,
-        landlord_up_played_cards,
-        landlord_down_played_cards,
-        landlord_num_cards_left,
-        landlord_up_num_cards_left,
-        landlord_down_num_cards_left,
+        played_cards['landlord'],
+        played_cards['landlord_up'],
+        played_cards['landlord_down'],
+        num_cards_left[0],
         bomb_num,
-        bid_info,
-        multiply_info
+        bid_info
     ))
 
     # 动作序列特征

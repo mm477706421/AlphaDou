@@ -4,7 +4,12 @@ import numpy as np
 import json
 import ast
 from douzero.evaluation.deep_agent import DeepAgent, SupervisedModel
-from collections import Counter
+from copy import deepcopy
+from douzero.env import move_detector as md, move_selector as ms
+from douzero.env.move_generator import MovesGener
+
+# 导入game_eval中的InfoSet类
+from game_eval import InfoSet, bombs, EnvCard2RealCard, RealCard2EnvCard
 
 app = Flask(__name__)
 
@@ -20,221 +25,205 @@ bid_model = SupervisedModel()
 # 密码验证
 PASSWD = "12345678"
 
-class InfoSet(object):
-    """
-    根据douzero/env/game.py中的InfoSet类定义的简化版本
-    只包含API所需的必要信息
-    """
-    def __init__(self, player_position):
-        # 玩家位置：landlord, landlord_down, landlord_up, first, second, third
-        self.player_position = player_position
-        # 当前玩家的手牌
-        self.player_hand_cards = []
-        # 每个玩家剩余的牌数
-        self.num_cards_left_dict = {'landlord': 0, 'landlord_up': 0, 'landlord_down': 0}
-        # 三张地主牌
-        self.three_landlord_cards = []
-        # 叫牌信息
-        self.bid_info = [-1, -1, -1]
-        # 出牌历史
-        self.card_play_action_seq = []
-        # 其他玩家的手牌（联合）
-        self.other_hand_cards = []
-        # 当前合法动作
-        self.legal_actions = []
-        # 最后一手牌
-        self.last_move = []
-        # 最近两手牌
-        self.last_two_moves = []
-        # 各位置最后出的牌
-        self.last_move_dict = {}
-        # 已出的牌
-        self.played_cards = {'landlord': [], 'landlord_up': [], 'landlord_down': []}
-        # 所有玩家的手牌
-        self.all_handcards = {'landlord': [], 'landlord_up': [], 'landlord_down': []}
-        # 最后出有效牌的玩家
-        self.last_pid = None
-        # 炸弹数量
-        self.bomb_num = 0
-        # 叫分
-        self.bid_count = 0
-        # 是否春天
-        self.spring = False
-        # 叫牌阶段是否结束
-        self.bid_over = True
-        # 出牌位置
-        self.play_card_position = None
-
 
 def create_infoset_for_act(player_position, player_hand_cards, three_landlord_cards, card_play_action_seq, bid_info):
     """
-    为出牌API创建InfoSet对象
+    为出牌API创建InfoSet对象，使用game_eval中的InfoSet类
     """
     infoset = InfoSet(player_position)
     infoset.player_hand_cards = player_hand_cards
     infoset.three_landlord_cards = three_landlord_cards
-    infoset.card_play_action_seq = card_play_action_seq
     infoset.bid_info = bid_info
     infoset.bid_over = True
     
-    # 设置最后一手牌
-    if card_play_action_seq:
-        infoset.last_move = card_play_action_seq[-1]
-        if len(card_play_action_seq) >= 2:
-            infoset.last_two_moves = card_play_action_seq[-2:]
-    
-    # 计算合法动作
-    infoset.legal_actions = _get_legal_card_play_actions(player_hand_cards, infoset.last_move)
-    
-    # 设置其他必要信息
-    infoset.other_hand_cards = []  # 在实际应用中应该推断其他玩家的手牌
-    
-    # 设置所有玩家的手牌（简化处理）
-    infoset.all_handcards[player_position] = player_hand_cards
-    
-    # 设置已出的牌和最后出牌的玩家（简化处理）
+    # 设置出牌历史
+    infoset.card_play_action_seq = []
     positions = ['landlord', 'landlord_up', 'landlord_down']
-    current_pos_index = positions.index(player_position)
+    position_index = positions.index(player_position)
     
-    # 模拟出牌顺序
+    # 处理出牌历史
     for i, action in enumerate(card_play_action_seq):
+        actor_index = (position_index - len(card_play_action_seq) + i) % 3
+        actor = positions[actor_index]
+        infoset.card_play_action_seq.append((actor, action))
+    
+    # 设置最后一手牌
+    infoset.last_move = []
+    if infoset.card_play_action_seq:
+        if len(infoset.card_play_action_seq[-1][1]) == 0 and len(infoset.card_play_action_seq) > 1:
+            infoset.last_move = infoset.card_play_action_seq[-2][1]
+        else:
+            infoset.last_move = infoset.card_play_action_seq[-1][1]
+    
+    # 设置最近两手牌
+    infoset.last_two_moves = [[], []]
+    for card in infoset.card_play_action_seq[-2:]:
+        infoset.last_two_moves.insert(0, card[1])
+        infoset.last_two_moves = infoset.last_two_moves[:2]
+    
+    # 设置已出的牌和最后出牌的玩家
+    infoset.played_cards = {'landlord': [], 'landlord_up': [], 'landlord_down': []}
+    infoset.last_move_dict = {'landlord': [], 'landlord_up': [], 'landlord_down': []}
+    
+    for pos, action in infoset.card_play_action_seq:
         if action:  # 不是pass
-            pos_index = (current_pos_index + i) % 3
-            pos = positions[pos_index]
             infoset.played_cards[pos].extend(action)
-            infoset.last_pid = pos
             infoset.last_move_dict[pos] = action
+            infoset.last_pid = pos
     
     # 设置剩余牌数
-    for pos in positions:
-        if pos == player_position:
-            infoset.num_cards_left_dict[pos] = len(player_hand_cards)
-        else:
-            # 简化处理，假设其他玩家有15张牌
-            infoset.num_cards_left_dict[pos] = 15
+    infoset.num_cards_left_dict = {'landlord': 20, 'landlord_up': 17, 'landlord_down': 17}
+    for pos, actions in infoset.played_cards.items():
+        infoset.num_cards_left_dict[pos] -= len(actions)
+    
+    # 设置当前玩家剩余手牌
+    infoset.num_cards_left_dict[player_position] = len(player_hand_cards)
+    
+    # 计算炸弹数量
+    infoset.bomb_num = 0
+    for _, action in infoset.card_play_action_seq:
+        if action in bombs:
+            infoset.bomb_num += 1
+    
+    # 设置所有玩家的手牌（简化处理）
+    infoset.all_handcards = {pos: [] for pos in positions}
+    infoset.all_handcards[player_position] = player_hand_cards
+    
+    # 计算其他玩家的手牌（简化处理）
+    infoset.other_hand_cards = []
+    
+    # 获取合法动作
+    legal_actions = get_legal_card_play_actions(player_hand_cards, infoset.last_move)
+    infoset.legal_actions = legal_actions
     
     return infoset
 
 
 def create_infoset_for_bid(player_position, player_hand_cards, bid_info):
     """
-    为叫地主API创建InfoSet对象
+    为叫地主API创建InfoSet对象，使用game_eval中的InfoSet类
     """
-    infoset = InfoSet(player_position)
+    # 转换玩家位置到bid_infoset的格式
+    if player_position == 'landlord':
+        bid_position = 'first'
+    elif player_position == 'landlord_down':
+        bid_position = 'second'
+    elif player_position == 'landlord_up':
+        bid_position = 'third'
+    else:
+        bid_position = player_position
+    
+    infoset = InfoSet(bid_position)
     infoset.player_hand_cards = player_hand_cards
     infoset.bid_info = bid_info
     infoset.bid_over = False
     
     # 设置叫分的合法动作
-    infoset.legal_actions = _get_legal_bid_actions(bid_info)
+    bid_count = max([b for b in bid_info if b >= 0] + [0])
+    infoset.bid_count = bid_count
     
-    # 设置所有玩家的手牌（简化处理）
-    infoset.all_handcards[player_position] = player_hand_cards
+    legal_actions = get_legal_bid_actions(bid_count)
+    infoset.legal_actions = legal_actions
     
     return infoset
 
 
-def _get_legal_card_play_actions(player_hand_cards, last_move):
+def get_legal_card_play_actions(player_hand_cards, rival_move):
     """
-    获取出牌的合法动作
-    简化版本，实际应使用douzero/env/move_generator.py中的MovesGener类
+    获取出牌的合法动作，使用game_eval中的逻辑
     """
-    try:
-        from douzero.env.move_generator import MovesGener
-        
-        # 创建MovesGener对象
-        mg = MovesGener(player_hand_cards)
-        
-        # 获取所有可能的动作
-        all_moves = mg.gen_moves()
-        
-        if not last_move:
-            # 如果是第一手牌，可以出任何牌
-            legal_actions = all_moves
-        else:
-            # 如果不是第一手牌，需要根据上一手牌筛选合法动作
-            # 这里需要实现根据last_move筛选合法动作的逻辑
-            legal_actions = [[]]  # 暂时只返回"不出"
-            last_move_type = _get_move_type(last_move)
-            for move in all_moves:
-                if _is_valid_response(move, last_move, last_move_type):
-                    legal_actions.append(move)
-        
-        if not legal_actions:  # 如果没有合法动作，返回pass
-            return [[]]
-            
-        return legal_actions
-    except Exception as e:
-        print(f"Error generating legal actions: {e}")
-        # 如果出错，返回空列表和pass
-        return [[]]
+    mg = MovesGener(player_hand_cards)
+    
+    if not rival_move:
+        return mg.gen_moves()
+    
+    rival_type = md.get_move_type(rival_move)
+    rival_move_type = rival_type['type']
+    rival_move_len = rival_type.get('len', 1)
+    moves = list()
+    
+    if rival_move_type == md.TYPE_0_PASS:
+        moves = mg.gen_moves()
+    
+    elif rival_move_type == md.TYPE_1_SINGLE:
+        all_moves = mg.gen_type_1_single()
+        moves = ms.filter_type_1_single(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_2_PAIR:
+        all_moves = mg.gen_type_2_pair()
+        moves = ms.filter_type_2_pair(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_3_TRIPLE:
+        all_moves = mg.gen_type_3_triple()
+        moves = ms.filter_type_3_triple(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_4_BOMB:
+        all_moves = mg.gen_type_4_bomb() + mg.gen_type_5_king_bomb()
+        moves = ms.filter_type_4_bomb(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_5_KING_BOMB:
+        moves = []
+    
+    elif rival_move_type == md.TYPE_6_3_1:
+        all_moves = mg.gen_type_6_3_1()
+        moves = ms.filter_type_6_3_1(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_7_3_2:
+        all_moves = mg.gen_type_7_3_2()
+        moves = ms.filter_type_7_3_2(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_8_SERIAL_SINGLE:
+        all_moves = mg.gen_type_8_serial_single(repeat_num=rival_move_len)
+        moves = ms.filter_type_8_serial_single(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_9_SERIAL_PAIR:
+        all_moves = mg.gen_type_9_serial_pair(repeat_num=rival_move_len)
+        moves = ms.filter_type_9_serial_pair(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_10_SERIAL_TRIPLE:
+        all_moves = mg.gen_type_10_serial_triple(repeat_num=rival_move_len)
+        moves = ms.filter_type_10_serial_triple(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_11_SERIAL_3_1:
+        all_moves = mg.gen_type_11_serial_3_1(repeat_num=rival_move_len)
+        moves = ms.filter_type_11_serial_3_1(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_12_SERIAL_3_2:
+        all_moves = mg.gen_type_12_serial_3_2(repeat_num=rival_move_len)
+        moves = ms.filter_type_12_serial_3_2(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_13_4_2:
+        all_moves = mg.gen_type_13_4_2()
+        moves = ms.filter_type_13_4_2(all_moves, rival_move)
+    
+    elif rival_move_type == md.TYPE_14_4_22:
+        all_moves = mg.gen_type_14_4_22()
+        moves = ms.filter_type_14_4_22(all_moves, rival_move)
+    
+    if rival_move_type not in [md.TYPE_0_PASS, md.TYPE_4_BOMB, md.TYPE_5_KING_BOMB]:
+        moves = moves + mg.gen_type_4_bomb() + mg.gen_type_5_king_bomb()
+    
+    if len(rival_move) != 0:  # rival_move is not 'pass'
+        moves = moves + [[]]
+    
+    for m in moves:
+        m.sort()
+    
+    return moves
 
 
-def _get_move_type(move):
+def get_legal_bid_actions(bid_count):
     """
-    获取出牌类型
+    获取叫分的合法动作，使用game_eval中的逻辑
     """
-    if not move:
-        return "pass"
-    
-    # 统计牌的数量
-    counter = Counter(move)
-    if len(move) == 2 and 20 in move and 30 in move:
-        return "rocket"
-    elif len(set(move)) == 1 and len(move) == 4:
-        return "bomb"
-    elif len(move) == 1:
-        return "single"
-    elif len(move) == 2 and len(set(move)) == 1:
-        return "pair"
-    elif len(move) == 3 and len(set(move)) == 1:
-        return "triple"
-    # 其他类型暂时都返回None
-    return None
-
-
-def _is_valid_response(response_move, last_move, last_move_type):
-    """
-    判断response_move是否是对last_move的合法响应
-    """
-    if not response_move:
-        return True  # 可以选择不出
-    
-    response_type = _get_move_type(response_move)
-    
-    # 火箭可以打任何牌
-    if response_type == "rocket":
-        return True
-    
-    # 炸弹可以打非火箭的牌
-    if response_type == "bomb" and last_move_type != "rocket":
-        if last_move_type == "bomb":
-            return max(response_move) > max(last_move)
-        return True
-    
-    # 其他情况必须牌型相同，且大小更大
-    if response_type == last_move_type:
-        return max(response_move) > max(last_move)
-    
-    return False
-
-
-def _get_legal_bid_actions(bid_info):
-    """
-    获取叫分的合法动作
-    """
-    legal_actions = []
-    # 找出当前最高分
-    max_bid = max([b for b in bid_info if b >= 0] + [0])
-    
-    # 可以叫比当前最高分更高的分数
-    for i in range(max_bid + 1, 4):
-        legal_actions.append([i])
-    
-    # 始终可以选择不叫
-    legal_actions.append([0])
-    
-    return legal_actions
+    if bid_count == 0:
+        return [[0], [1], [2], [3]]
+    elif bid_count == 1:
+        return [[0], [2], [3]]
+    elif bid_count == 2:
+        return [[0], [3]]
+    else:
+        return [[0]]
 
 
 @app.route('/sandou_act', methods=['POST'])
