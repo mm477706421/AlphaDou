@@ -57,49 +57,89 @@ class DeepAgent:
 
 
     def act(self, infoset):
-        if self.model_type == "test":
-            obs = get_obs_douzero(infoset)
-        elif self.model_type == "best":
-            obs = _get_obs_resnet(infoset, infoset.player_position)
-        else:
-            obs = get_obs(infoset, bid_over=infoset.bid_over, new_model=True)
-
-        z_batch = torch.from_numpy(obs['z_batch']).float()
-        x_batch = torch.from_numpy(obs['x_batch']).float()
-        if torch.cuda.is_available():
-            z_batch, x_batch = z_batch.cuda(), x_batch.cuda()
-        if self.model_type != 'new':
-            y_pred = self.model.forward(z_batch, x_batch, return_value=True)['values']
-        else:
-            win_rate, win, lose = self.model.forward(z_batch, x_batch, return_value=True)['values']
-            if infoset.player_position in ["landlord", "landlord_up", "landlord_down"]:
-                _win_rate = (win_rate + 1) / 2
-                y_pred = _win_rate * win + (1. - _win_rate) * lose
-                _win_rate = _win_rate.detach().cpu().numpy()
-                y_pred = y_pred.detach().cpu().numpy()
-                if self.check_no_bombs(infoset.player_hand_cards) and infoset.spring is False and self.check_no_bombs(
-                        infoset.other_hand_cards):
-                    best_action_index = np.argmax(_win_rate, axis=0)[0]
-                    best_action = infoset.legal_actions[best_action_index]
-                else:
-                    y_pred = y_pred.flatten()
-                    _win_rate = _win_rate.flatten()
-                    max_adp = np.max(y_pred)
-                    if max_adp >= 0:
-                        min_threshold = max_adp * 0.95
-                    else:
-                        min_threshold = max_adp * 1.05
-                    valid_indices = np.where(y_pred >= min_threshold)[0]
-                    best_action_index = valid_indices[np.argmax(_win_rate[valid_indices])]
-                    best_action = infoset.legal_actions[best_action_index]
-                return best_action
+        try:
+            # 确保infoset具有所需的属性
+            self._ensure_infoset_attributes(infoset)
+            
+            if self.model_type == "test":
+                obs = get_obs_douzero(infoset)
+            elif self.model_type == "best":
+                obs = _get_obs_resnet(infoset, infoset.player_position)
             else:
-                y_pred = win_rate[:, :1] * win + win_rate[:, 1:2] * lose
-        y_pred = y_pred.detach().cpu().numpy()
+                obs = get_obs(infoset, bid_over=infoset.bid_over, new_model=True)
 
-        best_action_index = np.argmax(y_pred, axis=0)[0]
-        best_action = infoset.legal_actions[best_action_index]
-        return best_action
+            z_batch = torch.from_numpy(obs['z_batch']).float()
+            x_batch = torch.from_numpy(obs['x_batch']).float()
+            if torch.cuda.is_available():
+                z_batch, x_batch = z_batch.cuda(), x_batch.cuda()
+            if self.model_type != 'new':
+                y_pred = self.model.forward(z_batch, x_batch, return_value=True)['values']
+            else:
+                win_rate, win, lose = self.model.forward(z_batch, x_batch, return_value=True)['values']
+                if infoset.player_position in ["landlord", "landlord_up", "landlord_down"]:
+                    _win_rate = (win_rate + 1) / 2
+                    y_pred = _win_rate * win + (1. - _win_rate) * lose
+                    _win_rate = _win_rate.detach().cpu().numpy()
+                    y_pred = y_pred.detach().cpu().numpy()
+                    if self.check_no_bombs(infoset.player_hand_cards) and infoset.spring is False and self.check_no_bombs(
+                            infoset.other_hand_cards):
+                        best_action_index = np.argmax(_win_rate, axis=0)[0]
+                        best_action = infoset.legal_actions[best_action_index]
+                    else:
+                        y_pred = y_pred.flatten()
+                        _win_rate = _win_rate.flatten()
+                        max_adp = np.max(y_pred)
+                        if max_adp >= 0:
+                            min_threshold = max_adp * 0.95
+                        else:
+                            min_threshold = max_adp * 1.05
+                        valid_indices = np.where(y_pred >= min_threshold)[0]
+                        best_action_index = valid_indices[np.argmax(_win_rate[valid_indices])]
+                        best_action = infoset.legal_actions[best_action_index]
+                    return best_action
+                else:
+                    y_pred = win_rate[:, :1] * win + win_rate[:, 1:2] * lose
+            y_pred = y_pred.detach().cpu().numpy()
+
+            best_action_index = np.argmax(y_pred, axis=0)[0]
+            best_action = infoset.legal_actions[best_action_index]
+            return best_action
+        except Exception as e:
+            print(f"Error in DeepAgent.act: {e}")
+            # 如果出错，返回第一个合法动作或者空动作
+            if infoset.legal_actions:
+                return infoset.legal_actions[0]
+            return []
+    
+    def _ensure_infoset_attributes(self, infoset):
+        """确保InfoSet对象具有所需的所有属性"""
+        # 必需的属性列表
+        required_attrs = [
+            'player_position', 'player_hand_cards', 'num_cards_left_dict',
+            'three_landlord_cards', 'bid_info', 'card_play_action_seq',
+            'other_hand_cards', 'legal_actions', 'last_move', 'played_cards',
+            'all_handcards', 'bomb_num', 'spring', 'bid_over'
+        ]
+        
+        # 检查并设置缺失的属性
+        for attr in required_attrs:
+            if not hasattr(infoset, attr):
+                if attr == 'num_cards_left_dict':
+                    setattr(infoset, attr, {'landlord': 0, 'landlord_up': 0, 'landlord_down': 0})
+                elif attr == 'played_cards':
+                    setattr(infoset, attr, {'landlord': [], 'landlord_up': [], 'landlord_down': []})
+                elif attr == 'all_handcards':
+                    setattr(infoset, attr, {'landlord': [], 'landlord_up': [], 'landlord_down': []})
+                elif attr in ['player_hand_cards', 'three_landlord_cards', 'other_hand_cards', 'card_play_action_seq', 'legal_actions', 'last_move']:
+                    setattr(infoset, attr, [])
+                elif attr == 'bid_info':
+                    setattr(infoset, attr, [-1, -1, -1])
+                elif attr in ['bomb_num']:
+                    setattr(infoset, attr, 0)
+                elif attr in ['spring', 'bid_over']:
+                    setattr(infoset, attr, False)
+                else:
+                    setattr(infoset, attr, None)
 
 
 class SupervisedModel:
@@ -135,21 +175,26 @@ class SupervisedModel:
         return result[0].item()
 
     def act(self, infoset):
-        legal_action = infoset.legal_actions
-        obs = torch.flatten(self.RealToOnehot(infoset.player_hand_cards))
-        if self.gpu:
-            obs = obs.cuda()
-        predict = self.net.forward(obs.unsqueeze(0))
-        one = -0.1
-        two = 0
-        three = 0.1
-        if predict > three and ([3] in legal_action):
-            return [3]
-        elif predict > two and ([2] in legal_action):
-            return [2]
-        elif predict > one and ([1] in legal_action):
-            return [1]
-        else:
+        try:
+            legal_action = infoset.legal_actions
+            obs = torch.flatten(self.RealToOnehot(infoset.player_hand_cards))
+            if self.gpu:
+                obs = obs.cuda()
+            predict = self.net.forward(obs.unsqueeze(0))
+            one = -0.1
+            two = 0
+            three = 0.1
+            if predict > three and ([3] in legal_action):
+                return [3]
+            elif predict > two and ([2] in legal_action):
+                return [2]
+            elif predict > one and ([1] in legal_action):
+                return [1]
+            else:
+                return [0]
+        except Exception as e:
+            print(f"Error in SupervisedModel.act: {e}")
+            # 如果出错，返回不叫
             return [0]
 
 def RealToOnehot(cards):
